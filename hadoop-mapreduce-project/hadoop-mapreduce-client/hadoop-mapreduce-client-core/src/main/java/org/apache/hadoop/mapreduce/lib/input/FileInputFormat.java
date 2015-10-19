@@ -78,6 +78,12 @@ public abstract class FileInputFormat<K, V> extends InputFormat<K, V> {
       "mapreduce.input.fileinputformat.list-status.num-threads";
   public static final int DEFAULT_LIST_STATUS_NUM_THREADS = 1;
 
+  // payas - modification
+  public static final String LIST_STATUS_S3_OPTIMIZE =
+    "mapreduce.input.fileinputformat.list-status.s3-optimize";
+  public static final String DEFAULT_LIST_STATUS_S3_OPTIMIZE = "false";
+  // payas - modification
+
   private static final Log LOG = LogFactory.getLog(FileInputFormat.class);
 
   private static final double SPLIT_SLOP = 1.1;   // 10% slop
@@ -262,7 +268,13 @@ public abstract class FileInputFormat<K, V> extends InputFormat<K, V> {
         DEFAULT_LIST_STATUS_NUM_THREADS);
     StopWatch sw = new StopWatch().start();
     if (numThreads == 1) {
-      result = singleThreadedListStatus(job, dirs, inputFilter, recursive);
+      String s3Optimize = job.getConfiguration().get(LIST_STATUS_S3_OPTIMIZE, 
+         DEFAULT_LIST_STATUS_S3_OPTIMIZE).trim().toLowerCase();
+      if (s3Optimize.equals("true")) {
+        result = mySingleThreadedListStatus(job, dirs, inputFilter, recursive);
+      } else {
+        result = singleThreadedListStatus(job, dirs, inputFilter, recursive);
+      }
     } else {
       Iterable<FileStatus> locatedFiles = null;
       try {
@@ -276,10 +288,7 @@ public abstract class FileInputFormat<K, V> extends InputFormat<K, V> {
     }
     
     sw.stop();
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Time taken to get FileStatuses: "
-          + sw.now(TimeUnit.MILLISECONDS));
-    }
+    LOG.info("Time taken to get filestatuses: " + sw.now(TimeUnit.MILLISECONDS) + " ms");
     LOG.info("Total input paths to process : " + result.size()); 
     return result;
   }
@@ -324,7 +333,62 @@ public abstract class FileInputFormat<K, V> extends InputFormat<K, V> {
     }
     return result;
   }
-  
+
+  // payas - modified listing to reduce number of API calls
+  private List<FileStatus> mySingleThreadedListStatus(JobContext job, Path[] dirs,
+      PathFilter inputFilter, boolean recursive) throws IOException {
+    LOG.info("===== payas - executing modified ls code =======");
+    List<FileStatus> result = new ArrayList<FileStatus>();
+    List<IOException> errors = new ArrayList<IOException>();
+
+    for (int i = 0; i < dirs.length; i++) {
+      Path p = dirs[i];
+      FileSystem fs = p.getFileSystem(job.getConfiguration());
+      FileStatus[] matches = fs.globStatus(p, inputFilter);
+      if (matches == null) {
+        errors.add(new IOException("Input path is not there: " + p));
+      } else if (matches.length == 0) {
+        errors.add(new IOException("Input pattern " + p + " matches 0 files"));
+      } else {
+        for (FileStatus globStat: matches) {
+          if (globStat.isDirectory()) {
+            if (recursive) {
+              RemoteIterator<LocatedFileStatus> iter =
+                  fs.listLocatedStatus(globStat.getPath());
+              while (iter.hasNext()) {
+                LocatedFileStatus stat = iter.next();
+                if (inputFilter.accept(stat.getPath())) {
+                  if (stat.isDirectory()) {
+                    addInputPathRecursively(result, fs, stat.getPath(),
+                        inputFilter);
+                  } else {
+                    result.add(stat);
+                  }
+                }
+              }
+            } else {
+              // we don't need ls --recursive. So can do only 1 ls call
+              FileStatus[] stats = fs.listStatus(globStat.getPath());
+              for (FileStatus stat : stats) {
+                if (!stat.isDirectory() && inputFilter.accept(stat.getPath())) {
+                  result.add(stat);
+                }
+              }
+            }
+          } else {
+            result.add(globStat);
+          }
+        }
+      }
+    }
+
+    if (!errors.isEmpty()) {
+      throw new InvalidInputException(errors);
+    }
+    return result;
+  }
+
+
   /**
    * Add files in the input path recursively into the results.
    * @param result
