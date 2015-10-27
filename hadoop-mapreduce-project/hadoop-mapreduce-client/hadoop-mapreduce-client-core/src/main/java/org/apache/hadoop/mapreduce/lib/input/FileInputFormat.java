@@ -368,6 +368,9 @@ public abstract class FileInputFormat<K, V> extends InputFormat<K, V> {
               }
             } else {
               // we don't need ls --recursive. So can do only 1 ls call
+              // note here we get FileStatus objects, not LocatedFileStatus.
+              // the difference is that LocatedFileStatus has block locations as well,
+              // which doesn't make sense for S3 fs. Need to take care of this for HDFS.
               FileStatus[] stats = fs.listStatus(globStat.getPath());
               for (FileStatus stat : stats) {
                 if (!stat.isDirectory() && inputFilter.accept(stat.getPath())) {
