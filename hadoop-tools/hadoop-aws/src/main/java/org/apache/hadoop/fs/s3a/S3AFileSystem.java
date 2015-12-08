@@ -74,6 +74,8 @@ import static org.apache.hadoop.fs.s3a.Constants.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import redis.clients.jedis.Jedis;
+
 public class S3AFileSystem extends FileSystem {
   /**
    * Default blocksize as used in blocksize and FS status queries
@@ -91,6 +93,13 @@ public class S3AFileSystem extends FileSystem {
   public static final Logger LOG = LoggerFactory.getLogger(S3AFileSystem.class);
   private CannedAccessControlList cannedACL;
   private String serverSideEncryptionAlgorithm;
+
+  // meta data cache related fields
+  private static boolean cacheEnabled;
+  private static Jedis jedis;
+  private static int CACHE_TTL;
+  private static final String SEPARATOR = "%%";
+  //
 
   // The maximum number of entries that can be deleted in any call to s3
   private static final int MAX_ENTRIES_TO_DELETE = 1000;
@@ -312,6 +321,21 @@ public class S3AFileSystem extends FileSystem {
     serverSideEncryptionAlgorithm = conf.get(SERVER_SIDE_ENCRYPTION_ALGORITHM);
 
     setConf(conf);
+
+    cacheEnabled = conf.getBoolean(USE_CACHE, DEFAULT_USE_CACHE);
+    if (cacheEnabled) {
+      try {
+        String host = getConf().get(CACHE_HOST, DEFAULT_CACHE_HOST);
+        LOG.info("payas connecting to cache on host: " + host);
+        CACHE_TTL = getConf().getInt(TTL, DEFAULT_TTL);
+        LOG.info("payas ttl for cache keys: " + CACHE_TTL);
+        jedis = new Jedis(host);
+      } catch (Exception ex) {
+        LOG.info("payas Unable to connect to redis cache ", ex);
+        LOG.info("payas Disabling caching ... ");
+        cacheEnabled = false;
+      }
+    }
   }
 
   /**
@@ -723,7 +747,103 @@ public class S3AFileSystem extends FileSystem {
    * @throws FileNotFoundException when the path does not exist;
    *         IOException see specific implementation
    */
-  public FileStatus[] listStatus(Path f) throws FileNotFoundException,
+  @Override
+  public FileStatus[] listStatus(Path f) throws IOException {
+    if (!cacheEnabled) {
+      return s3aListStatus(f);
+    }
+
+    // adding a route to cache
+    String key = f.toString();   // can shorten the key to save space
+    Long ttl   = 5L;
+
+    try {
+      if (jedis.ttl(key) < ttl) {
+        // if a key has only ttl seconds to live, consider it as a cache miss
+        LOG.info("payas s3a cache miss. Caching list at path " + f);
+        FileStatus[] stats = s3aListStatus(f);
+        String[] metaData = new String[stats.length];
+
+        for (int i = 0; i < stats.length; i++) {
+          FileStatus stat = stats[i];
+          metaData[i] = fileStatusToStr(stat);
+        }
+
+        try {
+          jedis.del(key);
+          jedis.rpush(key, metaData);
+          jedis.expire(key, CACHE_TTL);
+        } catch (Exception ex) {
+          LOG.info("payas Unable to put data in cache ", ex);
+        }
+        return stats;
+
+      } else {
+        // cache hit
+        LOG.info("payas cache hit for " + f);
+        ArrayList<FileStatus> result = new ArrayList<>();
+        for (String value : jedis.lrange(key, 0, -1)) {
+          result.add(strToFileStatus(key, value));
+        }
+
+        return result.toArray(new FileStatus[result.size()]);
+      }
+    } catch (Exception ex) {
+      System.out.println("Cache exception for key: " + key + ", exception: ");
+      ex.printStackTrace(System.out);
+      return s3aListStatus(f);
+    }
+  }
+
+  // helper method for caching code. Converts a filestatus to a string that can
+  // be stored as a value in the cache
+  private String fileStatusToStr(FileStatus stat) throws IOException {
+    StringBuilder metaData = new StringBuilder();
+    metaData.append(stat.isDirectory()).append(SEPARATOR);
+    metaData.append(stat.getPath().getName()).append(SEPARATOR);
+    metaData.append(stat.getLen()).append(SEPARATOR);
+    metaData.append(stat.getReplication()).append(SEPARATOR);
+    metaData.append(stat.getBlockSize()).append(SEPARATOR);
+    metaData.append(stat.getModificationTime()).append(SEPARATOR);
+    metaData.append(stat.getAccessTime()).append(SEPARATOR);
+    metaData.append(stat.getOwner()).append(SEPARATOR);
+    metaData.append(stat.getGroup()).append(SEPARATOR);
+    metaData.append(stat.getPermission().toShort()).append(SEPARATOR);
+    if (stat.isSymlink()) {
+      metaData.append(stat.getSymlink().toString()).append(SEPARATOR);
+    } else {
+      metaData.append("");
+    }
+
+    return metaData.toString();
+  }
+
+  // helper method for the caching code. Converts a value back to a filestatus object
+  private FileStatus strToFileStatus(String key, String value) {
+    String[] tokens   = value.split(SEPARATOR, -1);
+    boolean isDir     = Boolean.parseBoolean(tokens[0]);
+    Path p            = new Path(key + "/" + tokens[1]);
+    Long len          = Long.parseLong(tokens[2]);
+    short repl        = Short.parseShort(tokens[3]);
+    Long blockSize    = Long.parseLong(tokens[4]);
+    Long modTime      = Long.parseLong(tokens[5]);
+    Long accessTime   = Long.parseLong(tokens[6]);
+    String owner      = tokens[7];
+    String group      = tokens[8];
+    FsPermission perm = new FsPermission(Short.parseShort(tokens[9]));
+
+    String symLinkStr = tokens[10];
+    Path symLink      = null;
+    if (symLinkStr != null && !symLinkStr.equals("")) {
+      symLink = new Path(symLinkStr);
+    }
+
+    FileStatus status = new FileStatus(len, isDir, repl, blockSize, modTime, accessTime, perm,
+            owner, group, symLink, p);
+    return status;
+  }
+
+  private FileStatus[] s3aListStatus(Path f) throws FileNotFoundException,
       IOException {
     String key = pathToKey(f);
     if (LOG.isDebugEnabled()) {

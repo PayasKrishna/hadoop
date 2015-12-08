@@ -115,4 +115,16 @@ public class Constants {
   public static final String S3N_FOLDER_SUFFIX = "_$folder$";
   public static final String FS_S3A_BLOCK_SIZE = "fs.s3a.block.size";
   public static final String FS_S3A = "s3a";
+
+  // whether to use cache or not
+  public static final String USE_CACHE = "fs.s3a.cache.enable";
+  public static final boolean DEFAULT_USE_CACHE = false;
+
+  // cache host to connect to, when caching metadata
+  public static final String CACHE_HOST = "fs.s3a.cache.host";
+  public static final String DEFAULT_CACHE_HOST = "localhost";
+
+  // ttl for keys in the cache
+  public static final String TTL = "fs.s3a.cache.ttl";
+  public static final int DEFAULT_TTL = 864000; // default 10 day ttl for cache keys
 }
