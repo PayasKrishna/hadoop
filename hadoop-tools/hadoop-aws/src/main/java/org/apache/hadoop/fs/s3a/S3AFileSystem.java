@@ -327,7 +327,7 @@ public class S3AFileSystem extends FileSystem {
       try {
         String host = getConf().get(CACHE_HOST, DEFAULT_CACHE_HOST);
         LOG.info("payas connecting to cache on host: " + host);
-        CACHE_TTL = getConf().getInt(TTL, DEFAULT_TTL);
+        CACHE_TTL = Math.abs(getConf().getInt(TTL, DEFAULT_TTL));
         LOG.info("payas ttl for cache keys: " + CACHE_TTL);
         jedis = new Jedis(host);
       } catch (Exception ex) {
@@ -760,23 +760,35 @@ public class S3AFileSystem extends FileSystem {
     try {
       if (jedis.ttl(key) < ttl) {
         // if a key has only ttl seconds to live, consider it as a cache miss
-        LOG.info("payas s3a cache miss. Caching list at path " + f);
-        FileStatus[] stats = s3aListStatus(f);
-        String[] metaData = new String[stats.length];
 
+        boolean populateCache = getConf().getBoolean("populate_cache", true);
+        FileStatus[] stats = s3aListStatus(f);
+
+        if (!populateCache) {
+          // This will help us control what we cache - for our case we only
+          // want to cache calls from default database. This flag gets set to
+          // false if any user table is referenced from hive.
+          return stats;
+        }
+
+        String[] metaData = new String[stats.length];
         for (int i = 0; i < stats.length; i++) {
           FileStatus stat = stats[i];
           metaData[i] = fileStatusToStr(stat);
         }
 
         try {
-          jedis.del(key);
-          jedis.rpush(key, metaData);
-          jedis.expire(key, CACHE_TTL);
+          if (metaData.length != 0) {
+            LOG.info("payas s3a cache miss. Caching list at path " + f);
+            jedis.del(key);
+            jedis.rpush(key, metaData);
+            jedis.expire(key, CACHE_TTL);
+          }
+          return stats;
         } catch (Exception ex) {
-          LOG.info("payas Unable to put data in cache ", ex);
+          LOG.info("payas Unable to write data to cache ", ex);
+          return stats;
         }
-        return stats;
 
       } else {
         // cache hit
